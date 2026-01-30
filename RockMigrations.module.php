@@ -2053,6 +2053,74 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
         $data['columns'] = $columns;
         $data = array_filter($data, fn($k) => !preg_match('/^col\d+/', $k), ARRAY_FILTER_USE_KEY);
         unset($data['maxCols']); // will be set by number of columns
+      } elseif ($item->type instanceof FieldtypeTextareas) {
+        $textareas = [];
+        $defs = $item->type->getTextareaDefinitions($item);
+
+        foreach ($defs as $name => $def) {
+          if (!is_array($def)) {
+            continue;
+          }
+
+          $row = [
+            'label' => $def[0] ?? '',
+            'description' => $def[1] ?? '',
+            'width' => isset($def[2]) ? (int) $def[2] : 0,
+            'notes' => $def[3] ?? '',
+            'required' => !empty($def[4]),
+            'if' => $def[5] ?? '',
+            'showIf' => $def[6] ?? '',
+            'requiredIf' => $def[7] ?? '',
+          ];
+
+          if ($this->wire->languages) {
+            $translatable = [
+              0 => 'label',
+              1 => 'description',
+              3 => 'notes',
+            ];
+
+            foreach ($this->wire->languages as $lang) {
+              if ($lang->isDefault()) {
+                continue;
+              }
+
+              $langDefs = $item->type->getTextareaDefinitions($item, true, $lang);
+              $lDef = $langDefs[$name] ?? null;
+
+              if (!$lDef) {
+                continue;
+              }
+
+              foreach ($translatable as $idx => $key) {
+                $val = $lDef[$idx] ?? '';
+                $defaultVal = $def[$idx] ?? '';
+
+                // Add translated value if valid and different from default
+                if ($val !== '' && $val !== $defaultVal) {
+                  // Convert existing string value to array structure if not already
+                  if (!is_array($row[$key])) {
+                    $row[$key] = ['default' => $row[$key]];
+                  }
+                  $row[$key][$lang->name] = $val;
+                }
+              }
+            }
+          }
+
+          // Simplify to string if only label exists
+          $textareas[$name] = (count($row) === 1 && isset($row['label'])) ? $row['label'] : $row;
+        }
+
+        $data['textareas'] = $textareas;
+        unset($data['definitions']);
+
+        // Remove language-specific definitions
+		if ($this->wire->languages) {
+		  foreach ($this->wire->languages->findNonDefault() as $lang) {
+		    unset($data["definitions{$lang->id}"]);
+		  }
+		}
       }
     } elseif ($item instanceof Template) {
       $data = $item->getExportData();
@@ -4628,6 +4696,16 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
         unset($data[$key]);
         continue;
       }
+
+      // support for FieldtypeTextareas
+      if ($key == 'textareas' or $key == 'textareas-') {
+        if ($field->type instanceof FieldtypeTextareas) {
+          $wipe = $key == 'textareas-';
+          $this->setTextareasDefinitions($field, $val, $wipe);
+        }
+        unset($data[$key]);
+        continue;
+      }
     }
 
     // set data
@@ -4804,6 +4882,179 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
   }
 
   /**
+   * Set definitions for a FieldtypeTextareas field
+   *
+   * This method configures multiple textarea fields within a single FieldtypeTextareas
+   * field, with support for labels, descriptions, width constraints, validation rules,
+   * conditional logic, and multilingual content.
+   *
+   * ~~~~~
+   * // Example 1: Basic author information (string format)
+   * $rm->createField('author_info', 'FieldtypeTextareas', [
+   *   'label' => 'Author Information',
+   *   'textareas' => [
+   *     'address' => 'Mailing Address',
+   *     'city' => [
+   *       'label' => 'City',
+   *       'description' => 'The city where the author lives (required)',
+   *       'required' => true,
+   *       'width' => 50,
+   *     ],
+   *     'state' => [
+   *       'label' => 'State/Province',
+   *       'description' => 'Specify 2-character abbreviation',
+   *       'width' => 25,
+   *     ],
+   *     'zip' => [
+   *       'label' => 'Zip/Postal Code',
+   *       'width' => 25,
+   *     ],
+   *     'publications' => [
+   *       'label' => 'Publications List',
+   *       'description' => 'Enter the publication titles',
+   *       'notes' => 'One per line',
+   *       'if' => 'template=author',
+   *     ],
+   *   ],
+   * ]);
+   *
+   * // Example 2: Multilingual definitions
+   * $rm->setTextareasDefinitions('author_info', [
+   *   'address' => [
+   *     'label' => [
+   *       'default' => 'Mailing Address',
+   *       'de' => 'Postanschrift',
+   *     ],
+   *   ],
+   *   'city' => [
+   *     'label' => [
+   *       'default' => 'City',
+   *       'de' => 'Stadt',
+   *     ],
+   *     'description' => [
+   *       'default' => 'The city where the author lives',
+   *       'de' => 'Die Stadt, in der der Autor lebt',
+   *     ],
+   *     'required' => true,
+   *     'width' => 50,
+   *   ],
+   * ]);
+   *
+   * // Example 3: Conditional visibility
+   * $rm->setTextareasDefinitions('author_info', [
+   *   'publications' => [
+   *     'label' => 'Publications List',
+   *     'showIf' => 'template=author',
+   *     'requiredIf' => 'template=author',
+   *   ],
+   * ]);
+   *
+   * // Example 4: Replace all definitions (wipe mode)
+   * $rm->setTextareasDefinitions('author_info', [
+   *   'new_field' => [
+   *     'label' => 'New Field',
+   *     'description' => 'This will replace all existing definitions',
+   *   ],
+   * ], true);
+   * ~~~~~
+   *
+   * @param Field|string $field Field name or Field instance
+   * @param array<string, string|array{
+   *   label?: string|array<string, string>,
+   *   description?: string|array<string, string>,
+   *   width?: int<0, 100>,
+   *   notes?: string|array<string, string>,
+   *   required?: bool,
+   *   if?: string,
+   *   showIf?: string,
+   *   requiredIf?: string
+   * }> $definitions Array of field definitions (supports multilingual values via ['default' => '...', 'de' => '...'])
+   * @param bool $wipe Merge behavior:
+   *   - `false` (default): Merge with existing definitions (preserves manual additions)
+   *   - `true`: Remove all existing definitions and replace with provided ones
+   *
+   * @return void
+   */
+  public function setTextareasDefinitions($field, array $definitions, bool $wipe = false): void
+  {
+  	$field = $this->getField($field);
+  	if (!$field || !$field->type instanceof FieldtypeTextareas) {
+  		return;
+  	}
+  	$existingDefinitions = $wipe ? [] : $field->type->getTextareaDefinitions($field);
+  	$finalDefinitions = array_merge($existingDefinitions, $definitions);
+  	$languages = $this->wire->languages;
+  	$buildDefinitionString = function (array $defs, ?int $langId = null) use ($languages): string {
+  		static $translatableFields = ['label', 'description', 'notes'];
+  		$lines = [];
+  		foreach ($defs as $name => $data) {
+  			// Simple string definition
+  			if (!is_array($data)) {
+  				if (!$langId && is_string($data)) {
+  					$lines[] = $data;
+  				}
+  				continue;
+  			}
+  			// Process multilingual fields
+  			if ($languages) {
+  				foreach ($translatableFields as $fieldName) {
+  					if (!isset($data[$fieldName]) || !is_array($data[$fieldName])) {
+  						continue;
+  					}
+  					$langValues = $data[$fieldName];
+  					$data[$fieldName] = $langValues['default'] ?? '';
+  					foreach ($languages->findNonDefault() as $lang) {
+  						$value = $langValues[$lang->name] ?? $langValues[$lang->id] ?? null;
+  						if ($value !== null) {
+  							$data["{$fieldName}{$lang->id}"] = $value;
+  						}
+  					}
+  				}
+  			}
+  			// Extract language-specific values
+  			$suffix = $langId ? (string) $langId : '';
+  			$label = $data["label{$suffix}"] ?? ($langId ? '' : $name);
+  			$description = $data["description{$suffix}"] ?? '';
+  			$notes = $data["notes{$suffix}"] ?? '';
+  			// Skip empty language-specific entries
+  			if ($langId && !$label && !$description && !$notes) {
+  				continue;
+  			}
+  			// Build definition parts
+  			$parts = [$name . (!$langId && !empty($data['required']) ? '*' : ''), $label];
+  			if ($description) $parts[] = $description;
+  			if ($notes) $parts[] = $notes;
+			if (!$langId) {
+				if ($width = (int) ($data['width'] ?? 0)) {
+					$parts[] = "{$width}%";
+				}
+			}
+			
+  			// Add conditional logic (only for default language)
+  			if (!$langId) {
+  				foreach (['if', 'showIf', 'requiredIf'] as $condition) {
+  					if (!empty($data[$condition])) {
+  						$parts[] = "{$condition}({$data[$condition]})";
+  					}
+  				}
+  			}
+  			$lines[] = implode(' = ', $parts);
+  		}
+  		return implode("\n", $lines);
+  	};
+  	// Set default language definitions
+  	$field->definitions = $buildDefinitionString($finalDefinitions);
+  	// Set language-specific definitions
+  	if ($languages) {
+  		foreach ($languages->findNonDefault() as $lang) {
+  			$field->set("definitions{$lang->id}", $buildDefinitionString($finalDefinitions, $lang->id));
+  		}
+  	}
+  	$field->save();
+  }
+
+
+	/**
    * Set columns for a FieldtypeTable field
    *
    * ~~~~~
