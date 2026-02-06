@@ -1835,7 +1835,7 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
    *
    * @return string
    */
-  public function getCode($item, $raw = false)
+  public function getCode($item, $raw = false, $clean = false)
   {
     if ($item instanceof Field) {
       $data = $item->getExportData();
@@ -2151,16 +2151,112 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
       unset($data['_rockmigrations_log']);
     }
 
+    if ($clean) {
+      $data = $this->cleanExportData($data, $item);
+    }
+
     // sort properties alphabetically
     ksort($data, SORT_NATURAL);
 
     // if code was requested as array return it now
     if ($raw == 2) return $data;
 
-    $code = $this->varexport($data);
+    $code = $this->exportClean($data);
     if ($raw) return $code;
     return "'{$item->name}' => $code";
   }
+
+  private function cleanExportData(array $data, $item): array
+  {
+    if (array_key_exists('flags', $data) && (int) $data['flags'] === 0) unset($data['flags']);
+    if (array_key_exists('fileSchema', $data)) unset($data['fileSchema']);
+
+    $defaults = [];
+
+    if ($item instanceof Field) {
+      if (method_exists($item->type, 'getConfigDefaults')) {
+        $defaults = $item->type->getConfigDefaults();
+      }
+
+      if (isset($item->inputfield) && method_exists($item->inputfield, 'getConfigDefaults')) {
+        $inputDefaults = $item->inputfield->getConfigDefaults();
+        if (is_array($inputDefaults)) $defaults = array_merge($defaults, $inputDefaults);
+      }
+    } elseif ($item instanceof Template) {
+      try {
+        $defaults = (new Template())->getExportData();
+      } catch (\Throwable $th) {
+        $defaults = [];
+      }
+    }
+
+    if ($defaults) {
+      foreach ($defaults as $key => $defaultValue) {
+        if (array_key_exists($key, $data) && $data[$key] === $defaultValue) {
+          unset($data[$key]);
+        }
+      }
+    }
+
+    $stripEmpty = function (array $arr) use (&$stripEmpty): array {
+      foreach ($arr as $key => $value) {
+        if (is_array($value)) {
+          $value = $stripEmpty($value);
+          if ($value === []) {
+            unset($arr[$key]);
+            continue;
+          }
+          $arr[$key] = $value;
+          continue;
+        }
+
+        if ($value === null) {
+          unset($arr[$key]);
+          continue;
+        }
+
+        if (is_string($value) && trim($value) === '') {
+          unset($arr[$key]);
+          continue;
+        }
+      }
+
+      return $arr;
+    };
+
+    return $stripEmpty($data);
+  }
+
+  private function exportClean($value, int $indent = 0): string
+  {
+    $indentStr = str_repeat('    ', $indent);
+    $nextIndentStr = str_repeat('    ', $indent + 1);
+
+    if (is_array($value)) {
+      if ($value === []) return '[]';
+
+      $isList = function_exists('array_is_list')
+        ? array_is_list($value)
+        : array_keys($value) === range(0, count($value) - 1);
+      $lines = [];
+
+      if ($isList) {
+        foreach ($value as $item) {
+          $lines[] = $nextIndentStr . $this->exportClean($item, $indent + 1) . ',';
+        }
+      } else {
+        foreach ($value as $key => $item) {
+          $keyExport = var_export($key, true);
+          $lines[] = $nextIndentStr . $keyExport . ' => ' . $this->exportClean($item, $indent + 1) . ',';
+        }
+      }
+
+      return "[\n" . implode("\n", $lines) . "\n" . $indentStr . "]";
+    }
+
+    return var_export($value, true);
+  }
+
 
   private function getConfigFileArray(string $file): array
   {
@@ -5946,7 +6042,15 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
     // early exit (eg when changing fieldtype)
     if (!$existing) return;
 
-    $code = $this->wire->sanitizer->entities1($this->getCode($item));
+    $clean = (bool) $this->wire->input->get('rm_clean', 'int');
+    $dataRaw = $this->getCode($item, 2, false);
+    $codeRaw = $this->exportClean($dataRaw);
+    $codeClean = $this->exportClean($this->cleanExportData($dataRaw, $item));
+    $code = $clean ? $codeClean : $codeRaw;
+    $codeHtml = $this->wire->sanitizer->entities1($code);
+    $cleanChecked = $clean ? ' checked' : '';
+    $codeRawJson = json_encode($codeRaw, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+    $codeCleanJson = json_encode($codeClean, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
     $codeExport = '<style>
       #rm-export {
         font-family: monospace;
@@ -5966,7 +6070,26 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
         -webkit-box-shadow: 0 0 1px rgba(255,255,255,.5);
       }
       </style>
-      <textarea id="rm-export" rows="15">' . $code . '</textarea>';
+      <div style="margin: 0 0 6px 0;">
+        <label style="cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+          <input type="checkbox" id="rm-clean-toggle" value="1"' . $cleanChecked . '>
+          Cleaner code export
+        </label>
+      </div>
+      <textarea id="rm-export" rows="15">' . $codeHtml . '</textarea>
+      <script>
+        (function() {
+          var toggle = document.getElementById("rm-clean-toggle");
+          var textarea = document.getElementById("rm-export");
+          var codeRaw = ' . $codeRawJson . ';
+          var codeClean = ' . $codeCleanJson . ';
+          if (!toggle) return;
+          toggle.addEventListener("change", function() {
+            if (!textarea) return;
+            textarea.value = toggle.checked ? codeClean : codeRaw;
+          });
+        })();
+      </script>';
     $form->add([
       'name' => '_RockMigrationsCopyInfo',
       'type' => 'markup',
