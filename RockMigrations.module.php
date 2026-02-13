@@ -4745,9 +4745,10 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
       }
 
       // define matrix items for RepeaterMatrix fields
-      if ($key === 'matrixItems') {
+      if ($key === 'matrixItems' || $key === 'matrixItems-') {
         if (wireInstanceOf($field->type, 'FieldtypeRepeaterMatrix')) {
-          $this->setMatrixItems($field, $val);
+          $wipe = $key === 'matrixItems-';
+          $this->setMatrixItems($field, $val, $wipe);
           unset($data[$key]);
           continue;
         }
