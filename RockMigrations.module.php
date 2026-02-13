@@ -1971,6 +1971,29 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
               $key = substr($k, strlen($prefix));
               if ($key === 'name') continue; // Name is the key in comboFields
               if ($key === 'ok') continue; // Internal flag
+
+              // Convert string options to array for export
+              if ($key === 'options' && is_string($v) && strpos($v, "\n") !== false) {
+                $options = [];
+                foreach (explode("\n", $v) as $line) {
+                  if (!$line = trim($line)) continue;
+                  $parts = explode('=', $line, 2);
+                  $val = trim($parts[0]);
+                  $label = trim($parts[1] ?? $val);
+                  if (!isset($parts[1]) && str_starts_with($val, '+')) $label = substr($label, 1);
+                  $options[$val] = $label;
+                }
+                $v = $options;
+              }
+
+              // Skip defaultValue if it is already defined in options via +key
+              if (
+                $key === 'defaultValue'
+                && isset($data[$prefix . 'options'])
+                && is_string($optString = $data[$prefix . 'options'])
+                && preg_match("/(^|\n)\+" . preg_quote($v, '/') . "(=|$|\n)/", $optString)
+              ) continue;
+
               $fieldData[$key] = $v;
             }
           }
@@ -4942,6 +4965,19 @@ class RockMigrations extends WireData implements Module, ConfigurableModule
             $v = $inputfield->className();
           }
         }
+
+        // Support array options (convert to string for storage)
+        if ($k == 'options' && is_array($v)) {
+          $lines = [];
+          foreach ($v as $val => $label) {
+            $isDefault = str_starts_with((string)$val, '+')
+              || (isset($f['defaultValue']) && $f['defaultValue'] == $val);
+            if (str_starts_with((string)$val, '+')) $val = substr($val, 1);
+            $lines[] = ($isDefault ? '+' : '') . "$val" . ($val == $label ? '' : "=$label");
+          }
+          $v = implode("\n", $lines);
+        }
+
         $field->set("i{$slot}_{$k}", $v);
       }
 
